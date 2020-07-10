@@ -1,0 +1,177 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: A CloudFormation template for Fargate.
+Parameters:
+  Image:
+    Type: String
+    Default: 844917469503.dkr.ecr.ap-southeast-1.amazonaws.com/job-flight-schedule:latest
+  TaskName:
+    Type: String
+    Default: "job-flight-schedule"
+
+Resources:
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref TaskName
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 1024
+      Memory: 2GB
+      ExecutionRoleArn: !Ref ExecutionRole
+      TaskRoleArn: !Ref TaskRole
+      ContainerDefinitions:
+        - Name: !Ref TaskName
+          Image: !Ref Image
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Join ['', ["/ecs/", !Ref TaskName]]
+              awslogs-region: "ap-southeast-1"
+              awslogs-stream-prefix: !Ref TaskName
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['', [!Ref TaskName, ExecutionRole]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: AmazonECSTaskExecutionRolePolicy
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                # Allow the ECS Tasks to download images from ECR and save CSV in S3
+                - 'ecr:GetAuthorizationToken'
+                - 'ecr:BatchCheckLayerAvailability'
+                - 'ecr:GetDownloadUrlForLayer'
+                - 'ecr:BatchGetImage'
+                - 's3:GetObject'
+                - 's3:GetObjectVersion'
+                - 's3:GetObjectTagging'
+                - 's3:GetObjectVersionTagging'
+              Resource:
+                - '*'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+  # A role for the containers
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['', [!Ref TaskName, TaskRole]]
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+  # A role for the step function          
+  StatesExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: "sts:AssumeRole"    
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'iam:PassRole'
+                Resource:
+                  - !GetAtt ExecutionRole.Arn
+                  - !GetAtt TaskRole.Arn
+              - Effect: Allow
+                Action:
+                  - 'ecs:RunTask'
+                Resource: !Ref TaskDefinition
+                Condition:
+                  ArnEquals:
+                    'ecs:cluster': "arn:aws:ecs:ap-southeast-1:844917469503:cluster/batch"
+              - Effect: Allow
+                Action:
+                  - 'ecs:StopTask'
+                  - 'ecs:DescribeTasks'
+                Resource: '*'
+                Condition:
+                  ArnEquals:
+                    'ecs:cluster': "arn:aws:ecs:ap-southeast-1:844917469503:cluster/batch"      
+              - Effect: Allow
+                Action:
+                  - 'events:PutTargets'
+                  - 'events:PutRule'
+                  - 'events:DescribeRule'
+                Resource: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule'
+
+  StateMachine:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      DefinitionString:
+        !Sub
+          - |-
+            {
+              "Comment": "A state machine to manage ECS Fargate",
+              "StartAt": "RunTask",
+              "States": {
+                "RunTask": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::ecs:runTask.sync",
+                  "Parameters": {
+                    "LaunchType": "FARGATE",
+                    "Cluster": "arn:aws:ecs:ap-southeast-1:844917469503:cluster/batch",
+                    "TaskDefinition": "${TaskDefinition}",
+                    "NetworkConfiguration": {
+                      "AwsvpcConfiguration": {
+                        "Subnets": ["${SubnetA}", "${SubnetB}"],
+                        "AssignPublicIp": "${AssignPublicIp}"
+                        }
+                    }
+                  },
+                  "End": true
+                }
+              }
+            }
+          - TaskDefinition: !Ref TaskDefinition
+            SubnetA: 'subnet-057c0ab888143fc54' 
+            SubnetB: 'subnet-055c0a5029ded1a22'
+            AssignPublicIp: 'ENABLED'
+      RoleArn: !GetAtt [ StatesExecutionRole, Arn ]
+      
+  CloudWatchRule:   
+    Type: 'AWS::Events::Rule'
+    Properties: 
+      ScheduleExpression: 'rate(1 day)'
+      State: ENABLED
+      Targets: 
+        - Arn: !Ref StateMachine
+          Id: statemachine
+          RoleArn: !GetAtt 'RuleRole.Arn'
+          
+  RuleRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'events.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      Policies:
+      - PolicyName: EventRulePolicy
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: 'states:StartExecution'
+            Resource: !Ref StateMachine
